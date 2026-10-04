@@ -2,6 +2,8 @@
 
 A Model Context Protocol (MCP) server that connects to your Homebox home inventory system, allowing AI assistants to query and explore your home inventory data in real-time.
 
+> **Fork note:** this is a fork of [jeeves5454/Homebox-mcp](https://github.com/jeeves5454/Homebox-mcp) updated for **Homebox v0.26+**, which merged items and locations into `/api/v1/entities` and renamed labels to tags (`/api/v1/tags`); the original endpoints return 404 there. The eight tool names are unchanged. `get_items_by_location` now includes items in nested locations (pass `recursive: false` for direct children only). The Open WebUI functions in `open-webui-functions/` have not been updated.
+
 ## What is This?
 
 This MCP server acts as a bridge between AI assistants (like Claude) and your Homebox home inventory database. It allows your AI assistant to:
@@ -269,7 +271,7 @@ If you want to modify the server:
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
 
 ## Support
 

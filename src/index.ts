@@ -29,7 +29,26 @@ interface HomeboxConfig {
   password: string;
 }
 
-// Homebox API client
+// Location node from GET /api/v1/entities/tree
+interface TreeNode {
+  id: string;
+  name: string;
+  type: string;
+  children: TreeNode[];
+}
+
+// Flattened location returned by list_locations
+interface FlatLocation {
+  id: string;
+  name: string;
+  parentId: string | null;
+  path: string;
+}
+
+// Homebox API client.
+// Homebox v0.26 merged items and locations into "entities" (entityType tells
+// them apart) and renamed labels to "tags"; the old /items, /locations and
+// /labels endpoints return 404. Tool names stay the same for MCP clients.
 class HomeboxClient {
   private axios: AxiosInstance;
   private config: HomeboxConfig;
@@ -53,8 +72,11 @@ class HomeboxClient {
       });
 
       if (response.data && response.data.token) {
-        this.authToken = response.data.token;
-        this.axios.defaults.headers.common["Authorization"] = `Bearer ${this.authToken}`;
+        this.authToken = response.data.token as string;
+        // Newer Homebox returns the token with its "Bearer " prefix already
+        this.axios.defaults.headers.common["Authorization"] = this.authToken.startsWith("Bearer ")
+          ? this.authToken
+          : `Bearer ${this.authToken}`;
       } else {
         throw new Error("Authentication failed: No token received");
       }
@@ -64,91 +86,154 @@ class HomeboxClient {
   }
 
   async searchItems(query: string): Promise<any> {
-    await this.ensureAuthenticated();
     try {
-      const response = await this.axios.get("/api/v1/items", {
-        params: { q: query },
-      });
-      return response.data;
+      const result = await this.queryEntities([["q", query]]);
+      // /entities only returns items; also report locations whose name matches
+      const q = query.toLowerCase();
+      const locations = (await this.flatLocations()).filter((l) =>
+        l.name.toLowerCase().includes(q)
+      );
+      return { ...result, matchingLocations: locations };
     } catch (error: any) {
       throw new Error(`Failed to search items: ${error.message}`);
     }
   }
 
   async getItem(itemId: string): Promise<any> {
-    await this.ensureAuthenticated();
     try {
-      const response = await this.axios.get(`/api/v1/items/${itemId}`);
-      return response.data;
+      return await this.getEntityWithPath(itemId);
     } catch (error: any) {
       throw new Error(`Failed to get item: ${error.message}`);
     }
   }
 
   async listLocations(): Promise<any> {
-    await this.ensureAuthenticated();
     try {
-      const response = await this.axios.get("/api/v1/locations");
-      return response.data;
+      return await this.flatLocations();
     } catch (error: any) {
       throw new Error(`Failed to list locations: ${error.message}`);
     }
   }
 
   async getLocation(locationId: string): Promise<any> {
-    await this.ensureAuthenticated();
     try {
-      const response = await this.axios.get(`/api/v1/locations/${locationId}`);
-      return response.data;
+      return await this.getEntityWithPath(locationId);
     } catch (error: any) {
       throw new Error(`Failed to get location: ${error.message}`);
     }
   }
 
   async listLabels(): Promise<any> {
-    await this.ensureAuthenticated();
     try {
-      const response = await this.axios.get("/api/v1/labels");
-      return response.data;
+      return await this.get("/api/v1/tags");
     } catch (error: any) {
       throw new Error(`Failed to list labels: ${error.message}`);
     }
   }
 
   async getLabel(labelId: string): Promise<any> {
-    await this.ensureAuthenticated();
     try {
-      const response = await this.axios.get(`/api/v1/labels/${labelId}`);
-      return response.data;
+      return await this.get(`/api/v1/tags/${labelId}`);
     } catch (error: any) {
       throw new Error(`Failed to get label: ${error.message}`);
     }
   }
 
-  async getItemsByLocation(locationId: string): Promise<any> {
-    await this.ensureAuthenticated();
+  async getItemsByLocation(locationId: string, recursive = true): Promise<any> {
     try {
-      const response = await this.axios.get(`/api/v1/locations/${locationId}/items`);
-      return response.data;
+      const ids = [locationId];
+      if (recursive) {
+        const node = findNode(await this.locationTree(), locationId);
+        if (node) {
+          collectIds(node.children, ids);
+        }
+      }
+      return await this.queryEntities(ids.map((id) => ["parentIds", id]));
     } catch (error: any) {
       throw new Error(`Failed to get items by location: ${error.message}`);
     }
   }
 
   async getItemsByLabel(labelId: string): Promise<any> {
-    await this.ensureAuthenticated();
     try {
-      const response = await this.axios.get(`/api/v1/labels/${labelId}/items`);
-      return response.data;
+      return await this.queryEntities([["tags", labelId]]);
     } catch (error: any) {
       throw new Error(`Failed to get items by label: ${error.message}`);
     }
   }
 
-  private async ensureAuthenticated(): Promise<void> {
+  // GET with login on first use and one re-login if the token has expired
+  private async get(path: string, params?: URLSearchParams): Promise<any> {
     if (!this.authToken) {
       await this.authenticate();
     }
+    try {
+      return (await this.axios.get(path, { params })).data;
+    } catch (error: any) {
+      if (error.response?.status !== 401) {
+        throw error;
+      }
+      await this.authenticate();
+      return (await this.axios.get(path, { params })).data;
+    }
+  }
+
+  // Item search; repeated keys (parentIds, tags) are OR-ed by Homebox
+  private async queryEntities(params: [string, string][]): Promise<any> {
+    const search = new URLSearchParams(params);
+    search.set("pageSize", "-1");
+    const data = await this.get("/api/v1/entities", search);
+    return { total: data.total, items: data.items };
+  }
+
+  private async getEntityWithPath(id: string): Promise<any> {
+    const [entity, path] = await Promise.all([
+      this.get(`/api/v1/entities/${id}`),
+      this.get(`/api/v1/entities/${id}/path`),
+    ]);
+    return { ...entity, path: path.map((p: any) => p.name).join(" / ") };
+  }
+
+  private async locationTree(): Promise<TreeNode[]> {
+    return await this.get("/api/v1/entities/tree");
+  }
+
+  private async flatLocations(): Promise<FlatLocation[]> {
+    const out: FlatLocation[] = [];
+    const walk = (nodes: TreeNode[], parent: FlatLocation | null) => {
+      for (const n of nodes) {
+        const loc = {
+          id: n.id,
+          name: n.name,
+          parentId: parent ? parent.id : null,
+          path: parent ? `${parent.path} / ${n.name}` : n.name,
+        };
+        out.push(loc);
+        walk(n.children || [], loc);
+      }
+    };
+    walk(await this.locationTree(), null);
+    return out;
+  }
+}
+
+function findNode(nodes: TreeNode[], id: string): TreeNode | null {
+  for (const n of nodes) {
+    if (n.id === id) {
+      return n;
+    }
+    const hit = findNode(n.children || [], id);
+    if (hit) {
+      return hit;
+    }
+  }
+  return null;
+}
+
+function collectIds(nodes: TreeNode[], ids: string[]): void {
+  for (const n of nodes) {
+    ids.push(n.id);
+    collectIds(n.children || [], ids);
   }
 }
 
@@ -204,7 +289,7 @@ function loadConfig(): HomeboxConfig {
 const TOOLS: Tool[] = [
   {
     name: "search_items",
-    description: "Search for items in your Homebox inventory by name, description, or other fields. Returns a list of matching items with their basic information.",
+    description: "Search for items in your Homebox inventory by name, description, or other fields. Returns matching items (each with its parent location) plus locations whose name matches.",
     inputSchema: {
       type: "object",
       properties: {
@@ -218,7 +303,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "get_item",
-    description: "Get detailed information about a specific item by its ID. Returns complete item details including name, description, location, labels, purchase info, warranty info, and more.",
+    description: "Get detailed information about a specific item by its ID. Returns complete item details including name, description, location (parent and full path), tags, purchase info, warranty info, and more.",
     inputSchema: {
       type: "object",
       properties: {
@@ -232,7 +317,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "list_locations",
-    description: "List all locations in your Homebox inventory. Locations are where items are stored (e.g., 'Kitchen', 'Garage', 'Living Room'). Returns location names, IDs, and descriptions.",
+    description: "List all locations in your Homebox inventory. Locations are where items are stored (e.g., 'Kitchen', 'Garage', 'Living Room'). Returns every location (nested ones included) with its ID, name, parent ID and full path (e.g. '書房 / 系統櫃下層').",
     inputSchema: {
       type: "object",
       properties: {},
@@ -240,7 +325,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "get_location",
-    description: "Get detailed information about a specific location by its ID, including its name, description, and parent location if nested.",
+    description: "Get detailed information about a specific location by its ID, including its name, description, full path, parent location and child locations.",
     inputSchema: {
       type: "object",
       properties: {
@@ -254,7 +339,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "list_labels",
-    description: "List all labels in your Homebox inventory. Labels are used to categorize items (e.g., 'Electronics', 'Important', 'Fragile'). Returns label names, IDs, and descriptions.",
+    description: "List all labels (called tags since Homebox v0.26) in your Homebox inventory. Labels are used to categorize items (e.g., 'Electronics', 'Important', 'Fragile'). Returns label names, IDs, and descriptions.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -276,13 +361,17 @@ const TOOLS: Tool[] = [
   },
   {
     name: "get_items_by_location",
-    description: "Get all items stored in a specific location. Useful for finding everything in a particular room or storage area.",
+    description: "Get all items stored in a specific location. Useful for finding everything in a particular room or storage area. Includes items in nested locations unless recursive is false.",
     inputSchema: {
       type: "object",
       properties: {
         locationId: {
           type: "string",
           description: "The ID of the location",
+        },
+        recursive: {
+          type: "boolean",
+          description: "Also include items in nested locations (default true)",
         },
       },
       required: ["locationId"],
@@ -356,13 +445,11 @@ async function main() {
     // Handle tool calls
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
       console.error("CallTool request received:", request.params.name);
-      const { name, arguments: args } = request.params;
+      const { name } = request.params;
+      // Tools without parameters may be called with no arguments object
+      const args = request.params.arguments ?? {};
 
       try {
-        if (!args) {
-          throw new Error("Missing arguments");
-        }
-
         switch (name) {
         case "search_items": {
           const result = await homeboxClient.searchItems(args.query as string);
@@ -437,7 +524,10 @@ async function main() {
         }
 
         case "get_items_by_location": {
-          const result = await homeboxClient.getItemsByLocation(args.locationId as string);
+          const result = await homeboxClient.getItemsByLocation(
+            args.locationId as string,
+            args.recursive !== false
+          );
           return {
             content: [
               {

@@ -87,22 +87,22 @@ async function testConnection() {
         baseURL: config.homeboxUrl,
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${response.data.token}`,
+          'Authorization': response.data.token.startsWith('Bearer ') ? response.data.token : `Bearer ${response.data.token}`,
         },
       });
 
       console.log('\nTesting API access...');
 
       try {
-        const locationsResponse = await authClient.get('/api/v1/locations');
+        const locationsResponse = await authClient.get('/api/v1/entities/tree');
         console.log('   ✅ Successfully fetched locations');
-        console.log(`   Found ${locationsResponse.data?.items?.length || 0} locations`);
+        console.log(`   Found ${locationsResponse.data?.length || 0} top-level locations`);
       } catch (error) {
         console.log('   ⚠️  Could not fetch locations (this might be normal if you have no locations yet)');
       }
 
       try {
-        const itemsResponse = await authClient.get('/api/v1/items');
+        const itemsResponse = await authClient.get('/api/v1/entities');
         console.log('   ✅ Successfully fetched items');
         console.log(`   Found ${itemsResponse.data?.items?.length || 0} items`);
       } catch (error) {
