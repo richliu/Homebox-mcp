@@ -9,6 +9,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import axios, { AxiosInstance } from "axios";
 import { readFileSync, existsSync } from "fs";
+import { basename } from "path";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import { createRequire } from "module";
@@ -162,6 +163,166 @@ class HomeboxClient {
     }
   }
 
+  // ---- write operations -------------------------------------------------
+
+  async createItem(input: ItemFields & { name: string }): Promise<any> {
+    try {
+      const created = await this.request("post", "/api/v1/entities", {
+        name: input.name,
+        description: input.description ?? "",
+        quantity: input.quantity ?? 1,
+        parentId: input.locationId,
+        tagIds: input.tagIds ?? [],
+        entityTypeId: await this.entityTypeId(false),
+      });
+      // EntityCreate has no manufacturer/model/serial/notes; set them with an update
+      const extra = { ...input } as any;
+      for (const k of ["name", "description", "quantity", "locationId", "tagIds"]) {
+        delete extra[k];
+      }
+      if (Object.values(extra).some((v) => v !== undefined)) {
+        await this.updateEntity(created.id, extra);
+      }
+      return await this.getEntityWithPath(created.id);
+    } catch (error: any) {
+      throw new Error(`Failed to create item: ${describe(error)}`);
+    }
+  }
+
+  async updateItem(itemId: string, changes: ItemFields & { name?: string; archived?: boolean }): Promise<any> {
+    try {
+      await this.updateEntity(itemId, changes);
+      return await this.getEntityWithPath(itemId);
+    } catch (error: any) {
+      throw new Error(`Failed to update item: ${describe(error)}`);
+    }
+  }
+
+  async moveItem(itemId: string, locationId: string): Promise<any> {
+    try {
+      await this.request("patch", `/api/v1/entities/${itemId}`, { id: itemId, parentId: locationId });
+      return await this.getEntityWithPath(itemId);
+    } catch (error: any) {
+      throw new Error(`Failed to move item: ${describe(error)}`);
+    }
+  }
+
+  async deleteItem(itemId: string): Promise<any> {
+    try {
+      const entity = await this.getEntityWithPath(itemId);
+      await this.request("delete", `/api/v1/entities/${itemId}`);
+      return { deleted: true, id: itemId, name: entity.name, path: entity.path };
+    } catch (error: any) {
+      throw new Error(`Failed to delete item: ${describe(error)}`);
+    }
+  }
+
+  async uploadPhoto(itemId: string, filePath: string, primary = true): Promise<any> {
+    try {
+      const name = basename(filePath);
+      const form = new FormData();
+      form.append("file", new Blob([readFileSync(filePath)], { type: mimeType(name) }), name);
+      form.append("name", name);
+      form.append("type", "photo");
+      form.append("primary", String(primary));
+      await this.request("post", `/api/v1/entities/${itemId}/attachments`, form);
+      const entity = await this.get(`/api/v1/entities/${itemId}`);
+      return { id: itemId, name: entity.name, imageId: entity.imageId, attachments: entity.attachments?.length ?? 0 };
+    } catch (error: any) {
+      throw new Error(`Failed to upload photo: ${describe(error)}`);
+    }
+  }
+
+  async createLocation(name: string, parentId?: string, description?: string): Promise<any> {
+    try {
+      const created = await this.request("post", "/api/v1/entities", {
+        name,
+        description: description ?? "",
+        parentId,
+        entityTypeId: await this.entityTypeId(true),
+      });
+      return await this.getEntityWithPath(created.id);
+    } catch (error: any) {
+      throw new Error(`Failed to create location: ${describe(error)}`);
+    }
+  }
+
+  async createLabel(name: string, description?: string): Promise<any> {
+    try {
+      return await this.request("post", "/api/v1/tags", { name, description: description ?? "" });
+    } catch (error: any) {
+      throw new Error(`Failed to create label: ${describe(error)}`);
+    }
+  }
+
+  // PUT replaces every field, so start from the current entity and overlay changes
+  private async updateEntity(id: string, changes: Record<string, any>): Promise<void> {
+    const e = await this.get(`/api/v1/entities/${id}`);
+    const body: Record<string, any> = {
+      id,
+      name: e.name,
+      description: e.description,
+      quantity: e.quantity,
+      archived: e.archived,
+      assetId: e.assetId,
+      insured: e.insured,
+      lifetimeWarranty: e.lifetimeWarranty,
+      manufacturer: e.manufacturer,
+      modelNumber: e.modelNumber,
+      serialNumber: e.serialNumber,
+      notes: e.notes,
+      purchaseDate: e.purchaseDate || null,
+      purchaseFrom: e.purchaseFrom,
+      purchasePrice: e.purchasePrice,
+      soldDate: e.soldDate || null,
+      soldNotes: e.soldNotes,
+      soldPrice: e.soldPrice,
+      soldTo: e.soldTo,
+      warrantyDetails: e.warrantyDetails,
+      warrantyExpires: e.warrantyExpires || null,
+      syncChildEntityLocations: e.syncChildEntityLocations,
+      fields: e.fields ?? [],
+      entityTypeId: e.entityType?.id,
+      parentId: e.parent?.id ?? null,
+      tagIds: (e.tags ?? []).map((t: any) => t.id),
+    };
+    for (const [k, v] of Object.entries(changes)) {
+      if (v === undefined) {
+        continue;
+      }
+      body[k === "locationId" ? "parentId" : k] = v;
+    }
+    await this.request("put", `/api/v1/entities/${id}`, body);
+  }
+
+  private async entityTypeId(isLocation: boolean): Promise<string> {
+    const types: any[] = await this.get("/api/v1/entity-types");
+    const t = types.find((x) => x.isLocation === isLocation);
+    if (!t) {
+      throw new Error(`no ${isLocation ? "location" : "item"} entity type in Homebox`);
+    }
+    return t.id;
+  }
+
+  // Non-GET request with the same login / re-login handling as get()
+  private async request(method: "post" | "put" | "patch" | "delete", path: string, data?: any): Promise<any> {
+    if (!this.authToken) {
+      await this.authenticate();
+    }
+    // FormData must set its own multipart Content-Type
+    const headers = data instanceof FormData ? { "Content-Type": undefined as any } : undefined;
+    const send = () => this.axios.request({ method, url: path, data, headers });
+    try {
+      return (await send()).data;
+    } catch (error: any) {
+      if (error.response?.status !== 401) {
+        throw error;
+      }
+      await this.authenticate();
+      return (await send()).data;
+    }
+  }
+
   // GET with login on first use and one re-login if the token has expired
   private async get(path: string, params?: URLSearchParams): Promise<any> {
     if (!this.authToken) {
@@ -235,6 +396,33 @@ function collectIds(nodes: TreeNode[], ids: string[]): void {
     ids.push(n.id);
     collectIds(n.children || [], ids);
   }
+}
+
+// Optional item fields shared by create_item and update_item
+interface ItemFields {
+  description?: string;
+  quantity?: number;
+  locationId?: string;
+  tagIds?: string[];
+  manufacturer?: string;
+  modelNumber?: string;
+  serialNumber?: string;
+  notes?: string;
+}
+
+function mimeType(name: string): string {
+  const ext = name.toLowerCase().split(".").pop();
+  const types: Record<string, string> = {
+    jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp", gif: "image/gif", heic: "image/heic",
+  };
+  return types[ext ?? ""] ?? "application/octet-stream";
+}
+
+// Include Homebox's own error message (e.g. validation details) when there is one
+function describe(error: any): string {
+  const body = error.response?.data;
+  const detail = typeof body === "string" ? body : body?.error ?? body?.message;
+  return detail ? `${error.message}: ${detail}` : error.message;
 }
 
 // Load configuration from multiple sources
@@ -391,6 +579,107 @@ const TOOLS: Tool[] = [
       required: ["labelId"],
     },
   },
+  {
+    name: "create_item",
+    description: "Create a new item. Returns the created item with its ID and full location path. Writes to the inventory: only call after the user has confirmed the details.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Item name" },
+        description: { type: "string", description: "Free-text description" },
+        quantity: { type: "number", description: "How many (default 1 on create)" },
+        locationId: { type: "string", description: "ID of the location the item is stored in (see list_locations)" },
+        tagIds: { type: "array", items: { type: "string" }, description: "Label/tag IDs (see list_labels); on update this replaces the existing tags" },
+        manufacturer: { type: "string", description: "Brand / manufacturer" },
+        modelNumber: { type: "string", description: "Model number" },
+        serialNumber: { type: "string", description: "Serial number" },
+        notes: { type: "string", description: "Notes" },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "update_item",
+    description: "Change fields of an existing item; fields left out keep their current value. Set archived to true to archive (soft-delete) an item, false to restore it. Writes to the inventory: only call after the user has confirmed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        itemId: { type: "string", description: "The ID of the item to change" },
+        name: { type: "string", description: "New item name" },
+        archived: { type: "boolean", description: "true archives the item (hidden from normal lists, data and photos kept), false restores it" },
+        description: { type: "string", description: "Free-text description" },
+        quantity: { type: "number", description: "How many (default 1 on create)" },
+        locationId: { type: "string", description: "ID of the location the item is stored in (see list_locations)" },
+        tagIds: { type: "array", items: { type: "string" }, description: "Label/tag IDs (see list_labels); on update this replaces the existing tags" },
+        manufacturer: { type: "string", description: "Brand / manufacturer" },
+        modelNumber: { type: "string", description: "Model number" },
+        serialNumber: { type: "string", description: "Serial number" },
+        notes: { type: "string", description: "Notes" },
+      },
+      required: ["itemId"],
+    },
+  },
+  {
+    name: "move_item",
+    description: "Move an item (or a location) to another location. Writes to the inventory: only call after the user has confirmed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        itemId: { type: "string", description: "The ID of the item to move" },
+        locationId: { type: "string", description: "The ID of the destination location" },
+      },
+      required: ["itemId", "locationId"],
+    },
+  },
+  {
+    name: "delete_item",
+    description: "PERMANENTLY delete an item together with its photos and attachments; it cannot be undone. Prefer update_item with archived=true. Only call when the user has explicitly asked for permanent deletion and confirmed the exact item.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        itemId: { type: "string", description: "The ID of the item to delete" },
+      },
+      required: ["itemId"],
+    },
+  },
+  {
+    name: "upload_photo",
+    description: "Attach a photo from a local file on the MCP server's machine to an item, by default as its primary (cover) image.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        itemId: { type: "string", description: "The ID of the item" },
+        filePath: { type: "string", description: "Absolute path of the image file (jpg, png, webp, gif, heic)" },
+        primary: { type: "boolean", description: "Use as the item's primary image (default true)" },
+      },
+      required: ["itemId", "filePath"],
+    },
+  },
+  {
+    name: "create_location",
+    description: "Create a new location, optionally nested inside another one (e.g. a box inside a cabinet). Writes to the inventory: only call after the user has confirmed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Location name" },
+        parentId: { type: "string", description: "ID of the parent location; omit for a top-level location" },
+        description: { type: "string", description: "Free-text description" },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "create_label",
+    description: "Create a new label (tag). Writes to the inventory: only call after the user has confirmed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Label name" },
+        description: { type: "string", description: "Free-text description" },
+      },
+      required: ["name"],
+    },
+  },
 ];
 
 // Main server setup
@@ -540,6 +829,42 @@ async function main() {
 
         case "get_items_by_label": {
           const result = await homeboxClient.getItemsByLabel(args.labelId as string);
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(result, null, 2),
+              },
+            ],
+          };
+        }
+
+        case "create_item":
+        case "update_item":
+        case "move_item":
+        case "delete_item":
+        case "upload_photo":
+        case "create_location":
+        case "create_label": {
+          const a = args as any;
+          const fields = {
+            description: a.description,
+            quantity: a.quantity,
+            locationId: a.locationId,
+            tagIds: a.tagIds,
+            manufacturer: a.manufacturer,
+            modelNumber: a.modelNumber,
+            serialNumber: a.serialNumber,
+            notes: a.notes,
+          };
+          const result =
+            name === "create_item" ? await homeboxClient.createItem({ ...fields, name: a.name }) :
+            name === "update_item" ? await homeboxClient.updateItem(a.itemId, { ...fields, name: a.name, archived: a.archived }) :
+            name === "move_item" ? await homeboxClient.moveItem(a.itemId, a.locationId) :
+            name === "delete_item" ? await homeboxClient.deleteItem(a.itemId) :
+            name === "upload_photo" ? await homeboxClient.uploadPhoto(a.itemId, a.filePath, a.primary !== false) :
+            name === "create_location" ? await homeboxClient.createLocation(a.name, a.parentId, a.description) :
+            await homeboxClient.createLabel(a.name, a.description);
           return {
             content: [
               {

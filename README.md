@@ -213,6 +213,16 @@ The MCP server provides these tools:
 7. **get_items_by_location** - Get all items in a location
 8. **get_items_by_label** - Get all items with a label
 
+Write tools (they change your inventory; let the user confirm before calling them):
+
+9. **create_item** - Create an item (name, description, quantity, location, labels, manufacturer, model, serial, notes)
+10. **update_item** - Change an item's fields; `archived: true` archives it (soft delete), `false` restores it
+11. **move_item** - Move an item or location to another location
+12. **delete_item** - Permanently delete an item with its photos (cannot be undone; prefer archiving)
+13. **upload_photo** - Attach a local image file to an item, as its primary image by default
+14. **create_location** - Create a location, optionally nested in another
+15. **create_label** - Create a label (tag)
+
 ## Troubleshooting
 
 ### "Authentication failed"
